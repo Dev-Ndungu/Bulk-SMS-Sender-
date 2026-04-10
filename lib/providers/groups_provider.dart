@@ -1,5 +1,7 @@
 library;
 
+import 'dart:async';
+
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../models/contact_group.dart';
@@ -11,22 +13,29 @@ final groupsRepositoryProvider = Provider<GroupsRepository>(
 
 class GroupsNotifier extends Notifier<List<ContactGroup>> {
   @override
-  List<ContactGroup> build() =>
-      ref.read(groupsRepositoryProvider).getAll();
+  List<ContactGroup> build() {
+    final repo = ref.read(groupsRepositoryProvider);
+    final groups = repo.getAll();
+    unawaited(repo.cleanupDuplicates());
+    return groups;
+  }
 
   Future<void> add(ContactGroup group) async {
-    await ref.read(groupsRepositoryProvider).save(group);
-    state = ref.read(groupsRepositoryProvider).getAll();
+    final repo = ref.read(groupsRepositoryProvider);
+    await repo.save(group);
+    state = repo.getAll();
   }
 
   Future<void> update(ContactGroup group) async {
-    await ref.read(groupsRepositoryProvider).save(group);
-    state = ref.read(groupsRepositoryProvider).getAll();
+    final repo = ref.read(groupsRepositoryProvider);
+    await repo.save(group);
+    state = repo.getAll();
   }
 
   Future<void> delete(String id) async {
-    await ref.read(groupsRepositoryProvider).delete(id);
-    state = ref.read(groupsRepositoryProvider).getAll();
+    final repo = ref.read(groupsRepositoryProvider);
+    await repo.delete(id);
+    state = repo.getAll();
   }
 }
 

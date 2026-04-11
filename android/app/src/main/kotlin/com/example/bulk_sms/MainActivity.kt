@@ -3,13 +3,11 @@ package com.example.bulk_sms
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.role.RoleManager
-import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.provider.Telephony
-import android.telephony.SmsManager
 import android.telephony.SubscriptionManager
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
@@ -26,6 +24,7 @@ class MainActivity : FlutterActivity() {
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
         createNotificationChannel()
+        BulkSmsJobRunner.resumePendingJobs(applicationContext)
 
         // ── EventChannel: stream incoming SMS to Dart ──────────────────
         EventChannel(flutterEngine.dartExecutor.binaryMessenger, EVENT_CHANNEL)
@@ -61,9 +60,72 @@ class MainActivity : FlutterActivity() {
                                 ?: return@setMethodCallHandler result.error(
                                     "INVALID_ARG", "message is required", null)
                             val subId = call.argument<Int>("subscriptionId")
-                            sendSms(number, message, subId)
-                            // Write to system content provider so other apps see it
-                            writeSentSms(number, message)
+                            SmsSender.sendSms(applicationContext, number, message, subId)
+                            result.success(true)
+                        } catch (e: Exception) {
+                            result.error("SMS_ERROR", e.message, e.stackTraceToString())
+                        }
+                    }
+                    "startBulkSend" -> {
+                        try {
+                            val jobId = call.argument<String>("jobId")
+                                ?: return@setMethodCallHandler result.error(
+                                    "INVALID_ARG", "jobId is required", null)
+                            val message = call.argument<String>("message")
+                                ?: return@setMethodCallHandler result.error(
+                                    "INVALID_ARG", "message is required", null)
+                            val recipients = call.argument<List<Map<String, Any?>>>("recipients")
+                                ?: return@setMethodCallHandler result.error(
+                                    "INVALID_ARG", "recipients is required", null)
+                            val subId = call.argument<Int>("subscriptionId")
+                            val groupName = call.argument<String>("groupName")
+                            val delayMs = call.argument<Int>("delayMs") ?: 0
+                            val batchSize = call.argument<Int>("batchSize") ?: 50
+
+                            val job = BulkSmsJob(
+                                jobId = jobId,
+                                message = message,
+                                recipients = recipients.map { raw ->
+                                    val tags = (raw["mergeTags"] as? Map<*, *>)
+                                        ?.mapNotNull { entry ->
+                                            val key = entry.key as? String ?: return@mapNotNull null
+                                            val value = entry.value as? String ?: ""
+                                            key to value
+                                        }
+                                        ?.toMap()
+                                        ?: emptyMap()
+                                    BulkSmsRecipient(
+                                        number = raw["number"] as? String ?: "",
+                                        displayName = raw["displayName"] as? String,
+                                        mergeTags = tags,
+                                    )
+                                }.filter { it.number.isNotBlank() },
+                                subscriptionId = subId,
+                                groupName = groupName,
+                                delayMs = delayMs,
+                                batchSize = batchSize,
+                            )
+
+                            BulkSmsStore.saveJob(applicationContext, job)
+                            BulkSmsJobRunner.start(applicationContext, jobId)
+                            result.success(true)
+                        } catch (e: Exception) {
+                            result.error("SMS_ERROR", e.message, e.stackTraceToString())
+                        }
+                    }
+                    "getBulkSendJobs" -> {
+                        try {
+                            result.success(BulkSmsStore.getJobs(applicationContext).map(::bulkSmsJobToMap))
+                        } catch (e: Exception) {
+                            result.error("SYNC_ERROR", e.message, e.stackTraceToString())
+                        }
+                    }
+                    "cancelBulkSend" -> {
+                        try {
+                            val jobId = call.argument<String>("jobId")
+                                ?: return@setMethodCallHandler result.error(
+                                    "INVALID_ARG", "jobId is required", null)
+                            BulkSmsJobRunner.cancel(applicationContext, jobId)
                             result.success(true)
                         } catch (e: Exception) {
                             result.error("SMS_ERROR", e.message, e.stackTraceToString())
@@ -135,23 +197,6 @@ class MainActivity : FlutterActivity() {
         if (requestCode == REQUEST_DEFAULT_SMS) {
             pendingResult?.success(isDefaultSmsApp())
             pendingResult = null
-        }
-    }
-
-    // ── Write sent SMS to system content provider ───────────────────────
-    private fun writeSentSms(number: String, body: String) {
-        try {
-            val values = ContentValues().apply {
-                put(Telephony.Sms.ADDRESS, number)
-                put(Telephony.Sms.BODY, body)
-                put(Telephony.Sms.DATE, System.currentTimeMillis())
-                put(Telephony.Sms.TYPE, Telephony.Sms.MESSAGE_TYPE_SENT)
-                put(Telephony.Sms.READ, 1)
-                put(Telephony.Sms.SEEN, 1)
-            }
-            contentResolver.insert(Telephony.Sms.CONTENT_URI, values)
-        } catch (_: Exception) {
-            // Best effort — may fail if not default SMS app
         }
     }
 
@@ -260,38 +305,5 @@ class MainActivity : FlutterActivity() {
         return simList
     }
 
-    @Suppress("DEPRECATION")
-    private fun sendSms(number: String, message: String, subscriptionId: Int?) {
-        val smsManager: SmsManager = try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                // API 31+: service-based, then create for subscription if needed
-                val base = applicationContext.getSystemService(SmsManager::class.java)
-                    ?: throw IllegalStateException("SmsManager not available")
-                if (subscriptionId != null && subscriptionId >= 0) {
-                    base.createForSubscriptionId(subscriptionId)
-                } else {
-                    base
-                }
-            } else if (subscriptionId != null && subscriptionId >= 0
-                && Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP_MR1) {
-                @Suppress("DEPRECATION")
-                SmsManager.getSmsManagerForSubscriptionId(subscriptionId)
-            } else {
-                @Suppress("DEPRECATION")
-                SmsManager.getDefault()
-            }
-        } catch (e: Exception) {
-            @Suppress("DEPRECATION")
-            SmsManager.getDefault()
-        }
-
-        // Always use divideMessage to handle both single and multipart properly
-        val parts: ArrayList<String> = smsManager.divideMessage(message)
-        if (parts.size <= 1) {
-            smsManager.sendTextMessage(number, null, message, null, null)
-        } else {
-            smsManager.sendMultipartTextMessage(number, null, parts, null, null)
-        }
-    }
 }
 

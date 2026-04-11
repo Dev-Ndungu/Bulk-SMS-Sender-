@@ -16,6 +16,14 @@ class CampaignsRepository {
       ..sort((a, b) => b.sentAt.compareTo(a.sentAt)); // newest first
   }
 
+  CampaignSummary? getById(String id) {
+    final raw = _box.get(id);
+    if (raw is Map) {
+      return CampaignSummary.fromMap(raw);
+    }
+    return null;
+  }
+
   Future<void> save(CampaignSummary c) async {
     await _box.put(c.id, c.toMap());
   }

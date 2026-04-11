@@ -4,6 +4,7 @@ import 'package:permission_handler/permission_handler.dart';
 
 import '../providers/settings_provider.dart';
 import '../repositories/settings_repository.dart';
+import '../services/mpesa_simulator_service.dart';
 import '../services/sms_channel.dart';
 
 class SettingsScreen extends ConsumerStatefulWidget {
@@ -17,6 +18,12 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
   late final SettingsRepository _repo;
   List<SimCard> _sims = [];
   bool _isDefaultSms = false;
+  bool _simulating = false;
+
+  final _simNumberCtrl = TextEditingController(text: '+254712345678');
+  final _simCountCtrl = TextEditingController(text: '3');
+  final _simAmountCtrl = TextEditingController(text: '10');
+  final _simIntervalCtrl = TextEditingController(text: '5');
 
   @override
   void initState() {
@@ -24,6 +31,15 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
     _repo = ref.read(settingsRepositoryProvider);
     _loadSims();
     _checkDefaultSms();
+  }
+
+  @override
+  void dispose() {
+    _simNumberCtrl.dispose();
+    _simCountCtrl.dispose();
+    _simAmountCtrl.dispose();
+    _simIntervalCtrl.dispose();
+    super.dispose();
   }
 
   Future<void> _loadSims() async {
@@ -182,9 +198,118 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
               }
             },
           ),
+
+          const Divider(height: 32),
+          const _SectionHeader('Simulator'),
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  Text(
+                    'Send repeated M-Pesa-style receipts with unique transaction references.',
+                    style: Theme.of(context).textTheme.bodySmall,
+                  ),
+                  const SizedBox(height: 12),
+                  TextField(
+                    controller: _simNumberCtrl,
+                    keyboardType: TextInputType.phone,
+                    decoration: const InputDecoration(
+                      labelText: 'Send to number',
+                      hintText: '+254712345678',
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: TextField(
+                          controller: _simCountCtrl,
+                          keyboardType: TextInputType.number,
+                          decoration: const InputDecoration(
+                            labelText: 'Messages',
+                            hintText: '3',
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: TextField(
+                          controller: _simAmountCtrl,
+                          keyboardType: TextInputType.number,
+                          decoration: const InputDecoration(
+                            labelText: 'Amount (Ksh)',
+                            hintText: '10',
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 12),
+                  TextField(
+                    controller: _simIntervalCtrl,
+                    keyboardType: TextInputType.number,
+                    decoration: const InputDecoration(
+                      labelText: 'Interval (seconds)',
+                      hintText: '5',
+                    ),
+                  ),
+                  const SizedBox(height: 16),
+                  FilledButton.icon(
+                    onPressed: _simulating ? null : () => _runSimulator(context),
+                    icon: const Icon(Icons.play_circle_outline),
+                    label: Text(_simulating ? 'Simulating…' : 'Simulate & Send'),
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    'Each SMS gets a unique transaction code and is sent using the interval you choose.',
+                    style: Theme.of(context).textTheme.bodySmall,
+                  ),
+                ],
+              ),
+            ),
+          ),
         ],
       ),
     );
+  }
+
+  Future<void> _runSimulator(BuildContext context) async {
+    final number = _simNumberCtrl.text.trim();
+    final count = int.tryParse(_simCountCtrl.text.trim()) ?? 0;
+    final amount = double.tryParse(_simAmountCtrl.text.trim()) ?? 0;
+    final intervalSeconds = int.tryParse(_simIntervalCtrl.text.trim()) ?? 0;
+
+    if (number.isEmpty || count <= 0 || amount <= 0 || intervalSeconds < 0) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Enter a valid number, count, amount, and interval.')),
+      );
+      return;
+    }
+
+    setState(() => _simulating = true);
+    try {
+      final ok = await MpesaSimulatorService.sendTillSimulation(
+        number: number,
+        messageCount: count,
+        amount: amount,
+        interval: Duration(seconds: intervalSeconds),
+      );
+
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            ok
+                ? 'Simulator started for $count message(s).'
+                : 'Simulator could not start. Check SMS permission and number format.',
+          ),
+        ),
+      );
+    } finally {
+      if (mounted) setState(() => _simulating = false);
+    }
   }
 
   Future<int?> _intPicker(

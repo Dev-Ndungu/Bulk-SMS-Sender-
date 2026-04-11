@@ -1,5 +1,7 @@
 library;
 
+import 'dart:async';
+
 import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:uuid/uuid.dart';
@@ -8,19 +10,19 @@ import '../models/campaign_summary.dart';
 import '../models/delivery_record.dart';
 import '../models/recipient.dart';
 import '../models/send_job.dart';
-import '../repositories/reports_repository.dart';
+import '../services/bulk_send_sync_service.dart';
 import '../services/sms_channel.dart';
 import 'campaigns_provider.dart';
 import 'inbox_provider.dart';
+import 'reports_repository_provider.dart';
+import 'reports_provider.dart' as reports;
 import 'settings_provider.dart';
-
-// Shared repository provider (also imported by reports_provider)
-final reportsRepositoryProvider = Provider<ReportsRepository>(
-  (_) => ReportsRepository(),
-);
 
 class SendNotifier extends Notifier<SendJob> {
   bool _cancelled = false;
+  Timer? _pollTimer;
+  String? _activeJobId;
+  int _syncedRecordCount = 0;
 
   @override
   SendJob build() => SendJob(
@@ -29,7 +31,7 @@ class SendNotifier extends Notifier<SendJob> {
         message: '',
       );
 
-  /// Sends [message] to each recipient using the device's SMS.
+  /// Sends [message] to each recipient using a native background bulk job.
   /// Runs fully async – the user may navigate away; sending continues.
   Future<void> startSend({
     required List<Recipient> recipients,
@@ -37,8 +39,13 @@ class SendNotifier extends Notifier<SendJob> {
     String? groupName,
   }) async {
     _cancelled = false;
+    _pollTimer?.cancel();
+
     final jobId = const Uuid().v4();
     final sentAt = DateTime.now();
+    _activeJobId = jobId;
+    _syncedRecordCount = 0;
+
     state = SendJob(
       id: jobId,
       recipients: recipients,
@@ -46,12 +53,10 @@ class SendNotifier extends Notifier<SendJob> {
       status: JobStatus.running,
     );
 
-    // Save campaign record immediately so it appears in history even if
-    // the user force-quits before completion.
     final campaign = CampaignSummary(
       id: jobId,
       message: message,
-      numbers: recipients.map((r) => r.e164).toList(),
+      numbers: recipients.map((r) => r.e164).toList(growable: false),
       sentAt: sentAt,
       groupName: groupName,
     );
@@ -59,71 +64,180 @@ class SendNotifier extends Notifier<SendJob> {
       await ref.read(campaignsRepositoryProvider).save(campaign);
     } catch (_) {}
 
-    int sent = 0;
-    int failed = 0;
-
     try {
       final settingsRepo = ref.read(settingsRepositoryProvider);
       final subscriptionId = settingsRepo.selectedSimSubscriptionId;
       final delayMs = settingsRepo.interSmsDelayMs;
       final batchSize = settingsRepo.batchSize;
-      final reportsRepo = ref.read(reportsRepositoryProvider);
 
-      for (int i = 0; i < recipients.length; i++) {
-        if (_cancelled) break;
+      final started = await SmsChannel.startBulkSend(
+        jobId: jobId,
+        recipients: recipients
+            .map(
+              (r) => {
+                'number': r.e164,
+                'displayName': r.displayName,
+                'mergeTags': r.mergeTags,
+              },
+            )
+            .toList(growable: false),
+        message: message,
+        subscriptionId: subscriptionId >= 0 ? subscriptionId : null,
+        groupName: groupName,
+        delayMs: delayMs,
+        batchSize: batchSize,
+      );
 
-        final r = recipients[i];
-        final body = _applyMergeTags(message, r);
-
-        bool ok = false;
-        try {
-          ok = await SmsChannel.sendSms(
-            number: r.e164,
-            message: body,
-            subscriptionId: subscriptionId >= 0 ? subscriptionId : null,
-          );
-        } catch (_) {
-          ok = false;
-        }
-
-        // Save each record immediately so reports stay live.
-        final record = DeliveryRecord(
-          jobId: jobId,
-          number: r.e164,
-          messageBody: body,
-          status: ok ? DeliveryStatus.sent : DeliveryStatus.failed,
-          sentAt: DateTime.now(),
-          errorMessage: ok ? null : 'SMS send failed',
-        );
-        try { await reportsRepo.save(record); } catch (_) {}
-
-        if (ok) { sent++; } else { failed++; }
-
-        try {
-          state = state.copyWith(sent: sent, failed: failed);
-        } catch (_) {}
-
-        if (delayMs > 0) {
-          await Future.delayed(Duration(milliseconds: delayMs));
-        }
-        if ((i + 1) % batchSize == 0 && i + 1 < recipients.length) {
-          await Future.delayed(const Duration(milliseconds: 500));
-        }
+      if (started) {
+        _startPolling(jobId);
+        return;
       }
     } catch (e) {
-      debugPrint('Send loop error: $e');
+      debugPrint('Native bulk send error: $e');
     }
 
-    // Update campaign with final counts.
+    await _legacySendLoop(
+      jobId: jobId,
+      recipients: recipients,
+      message: message,
+      groupName: groupName,
+    );
+  }
+
+  void _startPolling(String jobId) {
+    _pollTimer?.cancel();
+    _pollTimer = Timer.periodic(const Duration(seconds: 1), (timer) async {
+      if (_cancelled || _activeJobId != jobId) {
+        timer.cancel();
+        return;
+      }
+
+      final snapshot = await BulkSendSyncService.fetchJob(jobId);
+      if (snapshot == null) return;
+
+      if (snapshot.records.length > _syncedRecordCount) {
+        await BulkSendSyncService.persistSnapshot(
+          snapshot,
+          alreadyPersistedCount: _syncedRecordCount,
+        );
+        _syncedRecordCount = snapshot.records.length;
+        ref.read(campaignsProvider.notifier).refresh();
+        ref.read(reports.reportsProvider.notifier).refresh();
+      }
+
+      try {
+        state = state.copyWith(sent: snapshot.sent, failed: snapshot.failed);
+      } catch (_) {}
+
+      if (snapshot.isComplete) {
+        await _finalizeFromSnapshot(snapshot);
+        timer.cancel();
+      }
+    });
+  }
+
+  Future<void> _finalizeFromSnapshot(BulkSendJobSnapshot snapshot) async {
+    if (_activeJobId != snapshot.jobId) return;
+
+    await BulkSendSyncService.persistSnapshot(
+      snapshot,
+      alreadyPersistedCount: _syncedRecordCount,
+    );
+    _syncedRecordCount = snapshot.records.length;
+
+    ref.read(campaignsProvider.notifier).refresh();
+    ref.read(reports.reportsProvider.notifier).refresh();
+    try {
+      ref.read(inboxProvider.notifier).loadThreads();
+    } catch (_) {}
+
+    try {
+      state = state.copyWith(
+        sent: snapshot.sent,
+        failed: snapshot.failed,
+        status: _cancelled ? JobStatus.cancelled : JobStatus.done,
+      );
+    } catch (_) {}
+  }
+
+  Future<void> _legacySendLoop({
+    required String jobId,
+    required List<Recipient> recipients,
+    required String message,
+    required String? groupName,
+  }) async {
+    final reportsRepo = ref.read(reportsRepositoryProvider);
+    var sent = 0;
+    var failed = 0;
+    final settingsRepo = ref.read(settingsRepositoryProvider);
+    final subscriptionId = settingsRepo.selectedSimSubscriptionId;
+    final delayMs = settingsRepo.interSmsDelayMs;
+    final batchSize = settingsRepo.batchSize;
+
+    for (int i = 0; i < recipients.length; i++) {
+      if (_cancelled) break;
+
+      final recipient = recipients[i];
+      final body = _applyMergeTags(message, recipient);
+      var ok = false;
+      try {
+        ok = await SmsChannel.sendSms(
+          number: recipient.e164,
+          message: body,
+          subscriptionId: subscriptionId >= 0 ? subscriptionId : null,
+        );
+      } catch (_) {
+        ok = false;
+      }
+
+      final record = DeliveryRecord(
+        jobId: jobId,
+        number: recipient.e164,
+        messageBody: body,
+        status: ok ? DeliveryStatus.sent : DeliveryStatus.failed,
+        sentAt: DateTime.now(),
+        errorMessage: ok ? null : 'SMS send failed',
+      );
+      try {
+        await reportsRepo.save(record);
+      } catch (_) {}
+
+      if (ok) {
+        sent++;
+      } else {
+        failed++;
+      }
+
+      try {
+        state = state.copyWith(sent: sent, failed: failed);
+      } catch (_) {}
+
+      if (delayMs > 0) {
+        await Future.delayed(Duration(milliseconds: delayMs));
+      }
+      if ((i + 1) % batchSize == 0 && i + 1 < recipients.length) {
+        await Future.delayed(const Duration(milliseconds: 500));
+      }
+    }
+
     try {
       await ref.read(campaignsRepositoryProvider).update(
-            campaign.copyWith(sent: sent, failed: failed),
+            CampaignSummary(
+              id: jobId,
+              message: message,
+              numbers: recipients.map((r) => r.e164).toList(growable: false),
+              sentAt: DateTime.now(),
+              sent: sent,
+              failed: failed,
+              groupName: groupName,
+            ),
           );
       ref.read(campaignsProvider.notifier).refresh();
     } catch (_) {}
 
-    // Refresh inbox threads (sent messages now in content provider).
-    try { ref.read(inboxProvider.notifier).loadThreads(); } catch (_) {}
+    try {
+      ref.read(inboxProvider.notifier).loadThreads();
+    } catch (_) {}
 
     try {
       state = state.copyWith(
@@ -132,10 +246,20 @@ class SendNotifier extends Notifier<SendJob> {
     } catch (_) {}
   }
 
-  void cancel() => _cancelled = true;
+  void cancel() {
+    _cancelled = true;
+    final jobId = _activeJobId;
+    if (jobId != null) {
+      unawaited(SmsChannel.cancelBulkSend(jobId));
+    }
+    _pollTimer?.cancel();
+  }
 
   void reset() {
     _cancelled = false;
+    _pollTimer?.cancel();
+    _activeJobId = null;
+    _syncedRecordCount = 0;
     state = SendJob(
       id: const Uuid().v4(),
       recipients: const [],
@@ -144,11 +268,12 @@ class SendNotifier extends Notifier<SendJob> {
   }
 
   String _applyMergeTags(String msg, Recipient r) {
-    String body = msg;
+    var body = msg;
     r.mergeTags.forEach((k, v) => body = body.replaceAll('{{$k}}', v));
     if (r.displayName != null) {
       body = body.replaceAll('{{name}}', r.displayName!);
     }
+    body = body.replaceAll('{{phone}}', r.e164);
     return body;
   }
 }

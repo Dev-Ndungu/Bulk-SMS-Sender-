@@ -4,7 +4,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../models/delivery_record.dart';
 import '../services/sms_channel.dart';
-import 'send_provider.dart';
+import 'reports_repository_provider.dart';
 import 'settings_provider.dart';
 
 class ReportsNotifier extends Notifier<List<DeliveryRecord>> {

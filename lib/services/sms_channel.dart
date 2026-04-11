@@ -92,6 +92,59 @@ class SmsChannel {
     }
   }
 
+  /// Starts a background bulk-send job on Android.
+  static Future<bool> startBulkSend({
+    required String jobId,
+    required List<Map<String, dynamic>> recipients,
+    required String message,
+    int? subscriptionId,
+    String? groupName,
+    int delayMs = 0,
+    int batchSize = 50,
+  }) async {
+    final smsPermission = await Permission.sms.request();
+    if (!smsPermission.isGranted) {
+      return false;
+    }
+
+    try {
+      await _ch.invokeMethod<bool>('startBulkSend', {
+        'jobId': jobId,
+        'recipients': recipients,
+        'message': message,
+        if (subscriptionId != null && subscriptionId >= 0)
+          'subscriptionId': subscriptionId,
+        if (groupName != null) 'groupName': groupName,
+        'delayMs': delayMs,
+        'batchSize': batchSize,
+      });
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// Returns all known bulk-send jobs from the native store.
+  static Future<List<Map<String, dynamic>>> getBulkSendJobs() async {
+    try {
+      final raw = await _ch.invokeMethod<List<dynamic>>('getBulkSendJobs') ?? [];
+      return raw
+          .map((e) => Map<String, dynamic>.from(e as Map))
+          .toList();
+    } catch (_) {
+      return [];
+    }
+  }
+
+  /// Cancels a native background bulk-send job.
+  static Future<bool> cancelBulkSend(String jobId) async {
+    try {
+      return await _ch.invokeMethod<bool>('cancelBulkSend', {'jobId': jobId}) ?? false;
+    } catch (_) {
+      return false;
+    }
+  }
+
   /// Returns `true` if this app is the device's default SMS app.
   static Future<bool> isDefaultSmsApp() async {
     try {

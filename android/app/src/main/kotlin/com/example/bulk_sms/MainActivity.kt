@@ -6,6 +6,7 @@ import android.app.role.RoleManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
 import android.provider.Telephony
 import android.telephony.SubscriptionManager
@@ -115,7 +116,30 @@ class MainActivity : FlutterActivity() {
                     }
                     "getBulkSendJobs" -> {
                         try {
-                            result.success(BulkSmsStore.getJobs(applicationContext).map(::bulkSmsJobToMap))
+                            result.success(
+                                BulkSmsStore.getJobs(
+                                    applicationContext,
+                                    includeRecords = false
+                                )
+                                    .map { bulkSmsJobToMap(it) }
+                            )
+                        } catch (e: Exception) {
+                            result.error("SYNC_ERROR", e.message, e.stackTraceToString())
+                        }
+                    }
+                    "getBulkSendJob" -> {
+                        try {
+                            val jobId = call.argument<String>("jobId")
+                                ?: return@setMethodCallHandler result.error(
+                                    "INVALID_ARG", "jobId is required", null)
+                            val recordsFrom = call.argument<Int>("recordsFrom") ?: 0
+                            val job = BulkSmsStore.getJob(
+                                applicationContext,
+                                jobId,
+                                includeRecords = true,
+                                recordsFrom = recordsFrom,
+                            )
+                            result.success(job?.let { bulkSmsJobToMap(it) })
                         } catch (e: Exception) {
                             result.error("SYNC_ERROR", e.message, e.stackTraceToString())
                         }
@@ -129,6 +153,17 @@ class MainActivity : FlutterActivity() {
                             result.success(true)
                         } catch (e: Exception) {
                             result.error("SMS_ERROR", e.message, e.stackTraceToString())
+                        }
+                    }
+                    "clearBulkSendJob" -> {
+                        try {
+                            val jobId = call.argument<String>("jobId")
+                                ?: return@setMethodCallHandler result.error(
+                                    "INVALID_ARG", "jobId is required", null)
+                            BulkSmsStore.clearJob(applicationContext, jobId)
+                            result.success(true)
+                        } catch (e: Exception) {
+                            result.error("SYNC_ERROR", e.message, e.stackTraceToString())
                         }
                     }
                     "isDefaultSmsApp" -> result.success(isDefaultSmsApp())
@@ -147,6 +182,23 @@ class MainActivity : FlutterActivity() {
                                     "INVALID_ARG", "number is required", null)
                             result.success(getMessagesForNumber(number))
                         } catch (e: Exception) { result.error("READ_ERROR", e.message, null) }
+                    }
+                    "deleteSmsMessage" -> {
+                        try {
+                            val rawMessageId = call.argument<Any>("messageId")
+                            val messageId = (rawMessageId as? Number)?.toLong()
+                                ?: return@setMethodCallHandler result.error(
+                                    "INVALID_ARG", "messageId is required", null)
+                            result.success(deleteSmsMessage(messageId))
+                        } catch (e: Exception) { result.error("DELETE_ERROR", e.message, null) }
+                    }
+                    "deleteConversation" -> {
+                        try {
+                            val number = call.argument<String>("number")
+                                ?: return@setMethodCallHandler result.error(
+                                    "INVALID_ARG", "number is required", null)
+                            result.success(deleteConversation(number))
+                        } catch (e: Exception) { result.error("DELETE_ERROR", e.message, null) }
                     }
                     else -> result.notImplemented()
                 }
@@ -245,6 +297,7 @@ class MainActivity : FlutterActivity() {
         val cursor = contentResolver.query(
             Telephony.Sms.CONTENT_URI,
             arrayOf(
+                Telephony.Sms._ID,
                 Telephony.Sms.ADDRESS,
                 Telephony.Sms.BODY,
                 Telephony.Sms.DATE,
@@ -256,14 +309,31 @@ class MainActivity : FlutterActivity() {
         cursor?.use {
             while (it.moveToNext()) {
                 results.add(mapOf(
-                    "number" to (it.getString(0) ?: number),
-                    "body" to (it.getString(1) ?: ""),
-                    "timestamp" to it.getLong(2),
-                    "type" to it.getInt(3)
+                    "id" to it.getLong(0),
+                    "number" to (it.getString(1) ?: number),
+                    "body" to (it.getString(2) ?: ""),
+                    "timestamp" to it.getLong(3),
+                    "type" to it.getInt(4)
                 ))
             }
         }
         return results
+    }
+
+    private fun deleteSmsMessage(messageId: Long): Boolean {
+        val uri = Uri.withAppendedPath(Telephony.Sms.CONTENT_URI, messageId.toString())
+        return contentResolver.delete(uri, null, null) > 0
+    }
+
+    private fun deleteConversation(number: String): Int {
+        val clean = number.replace(Regex("[^+0-9]"), "")
+        val matchSuffix = if (clean.length >= 9) clean.takeLast(9) else clean
+        if (matchSuffix.isBlank()) return 0
+        return contentResolver.delete(
+            Telephony.Sms.CONTENT_URI,
+            "${Telephony.Sms.ADDRESS} LIKE ?",
+            arrayOf("%$matchSuffix"),
+        )
     }
 
     private fun getSimCards(): List<Map<String, Any>> {

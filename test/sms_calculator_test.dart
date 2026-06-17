@@ -17,8 +17,15 @@ void main() {
       expect(info.charsPerSegment, 153);
     });
 
+    test('counts GSM-7 extension characters as two septets', () {
+      final info = SmsCalculator.calculate('Balance {KES} \u20AC');
+      expect(info.isUnicode, isFalse);
+      expect(info.charCount, 18);
+      expect(info.segments, 1);
+    });
+
     test('detects unicode content', () {
-      final info = SmsCalculator.calculate('🇰🇪');
+      final info = SmsCalculator.calculate('\u{1F1F0}\u{1F1EA}');
       expect(info.isUnicode, isTrue);
       expect(info.segments, 1);
     });

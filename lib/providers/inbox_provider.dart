@@ -123,6 +123,26 @@ class InboxNotifier extends Notifier<InboxState> {
     return ok;
   }
 
+  Future<bool> deleteMessage(SmsMessage message) async {
+    final id = message.id;
+    if (id == null) return false;
+    final ok = await SmsChannel.deleteSmsMessage(id);
+    if (ok) {
+      HiveService.inbox.delete(_messagesCacheKey(message.number));
+      await loadThreads();
+    }
+    return ok;
+  }
+
+  Future<int> deleteConversation(String number) async {
+    final count = await SmsChannel.deleteConversation(number);
+    if (count > 0) {
+      HiveService.inbox.delete(_messagesCacheKey(number));
+      await loadThreads();
+    }
+    return count;
+  }
+
   /// Record a sent message — just refresh threads from system.
   Future<void> addSent({
     required String number,

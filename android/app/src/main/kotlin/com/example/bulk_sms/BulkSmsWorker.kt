@@ -12,8 +12,12 @@ object BulkSmsJobRunner {
     private val runningJobs = ConcurrentHashMap<String, Future<*>>()
 
     fun resumePendingJobs(context: Context) {
-        BulkSmsStore.getJobs(context)
-            .filter { it.status == "queued" || it.status == "running" || it.status == "paused" }
+        BulkSmsStore.getJobs(context, includeRecords = false)
+            .filter {
+                (it.status == "running" || it.status == "paused") &&
+                    it.nextIndex > 0 &&
+                    it.nextIndex < it.recipients.size
+            }
             .forEach { start(context, it.jobId) }
     }
 
@@ -33,7 +37,7 @@ object BulkSmsJobRunner {
 
     private fun runJob(context: Context, jobId: String) {
         try {
-            val job = BulkSmsStore.getJob(context, jobId) ?: return
+            val job = BulkSmsStore.getJob(context, jobId, includeRecords = false) ?: return
             if (job.status == "cancelled" || job.status == "completed") return
 
             job.status = "running"
@@ -64,13 +68,14 @@ object BulkSmsJobRunner {
                     Log.e("BulkSmsJobRunner", "Failed to send SMS to ${recipient.number}", e)
                 }
 
-                job.records += BulkSmsRecord(
+                val record = BulkSmsRecord(
                     number = recipient.number,
                     messageBody = body,
                     status = if (ok) "sent" else "failed",
                     sentAt = System.currentTimeMillis(),
                     errorMessage = errorMessage,
                 )
+                BulkSmsStore.appendRecord(context, job.jobId, record)
                 if (ok) {
                     job.sent += 1
                 } else {
@@ -92,7 +97,7 @@ object BulkSmsJobRunner {
             job.status = "completed"
             BulkSmsStore.saveJob(context, job)
         } catch (e: Exception) {
-            val job = BulkSmsStore.getJob(context, jobId)
+            val job = BulkSmsStore.getJob(context, jobId, includeRecords = false)
             if (job != null && job.status != "cancelled") {
                 job.status = "failed"
                 BulkSmsStore.saveJob(context, job)
@@ -107,9 +112,7 @@ object BulkSmsJobRunner {
         recipient.mergeTags.forEach { (key, value) ->
             body = body.replace("{{$key}}", value)
         }
-        recipient.displayName?.let { name ->
-            body = body.replace("{{name}}", name)
-        }
+        body = body.replace("{{name}}", recipient.displayName ?: "")
         body = body.replace("{{phone}}", recipient.number)
         return body
     }

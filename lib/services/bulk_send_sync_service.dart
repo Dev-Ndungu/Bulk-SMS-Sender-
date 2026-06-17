@@ -118,12 +118,12 @@ class BulkSendSyncService {
     return jobs.map(BulkSendJobSnapshot.fromMap).toList(growable: false);
   }
 
-  static Future<BulkSendJobSnapshot?> fetchJob(String jobId) async {
-    final jobs = await fetchNativeJobs();
-    for (final job in jobs) {
-      if (job.jobId == jobId) return job;
-    }
-    return null;
+  static Future<BulkSendJobSnapshot?> fetchJob(
+    String jobId, {
+    int recordsFrom = 0,
+  }) async {
+    final raw = await SmsChannel.getBulkSendJob(jobId, recordsFrom: recordsFrom);
+    return raw == null ? null : BulkSendJobSnapshot.fromMap(raw);
   }
 
   /// Sync a native snapshot into Hive.
@@ -149,20 +149,28 @@ class BulkSendSyncService {
   }
 
   static Future<void> syncAllPending() async {
-    final jobs = await fetchNativeJobs();
+    final jobMetas = await fetchNativeJobs();
     final campaignsRepo = CampaignsRepository();
     final reportsRepo = ReportsRepository();
 
-    for (final job in jobs) {
-      final existingCampaign = campaignsRepo.getById(job.jobId);
-      final alreadyPersisted = (existingCampaign?.sent ?? 0) + (existingCampaign?.failed ?? 0);
+    for (final jobMeta in jobMetas) {
+      final existingCampaign = campaignsRepo.getById(jobMeta.jobId);
+      final alreadyPersisted =
+          (existingCampaign?.sent ?? 0) + (existingCampaign?.failed ?? 0);
+      final job = await fetchJob(
+            jobMeta.jobId,
+            recordsFrom: alreadyPersisted,
+          ) ??
+          jobMeta;
       await campaignsRepo.save(job.toCampaignSummary());
       final records = job.records
-          .skip(alreadyPersisted)
           .map((r) => r.toDeliveryRecord(job.jobId))
           .toList(growable: false);
       if (records.isNotEmpty) {
         await reportsRepo.saveAll(records);
+      }
+      if (job.isComplete) {
+        await SmsChannel.clearBulkSendJob(job.jobId);
       }
     }
   }

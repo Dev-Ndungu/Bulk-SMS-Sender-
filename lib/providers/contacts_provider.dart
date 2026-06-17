@@ -1,74 +1,142 @@
 library;
 
+import 'dart:async';
+
 import 'package:flutter_contacts/flutter_contacts.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:permission_handler/permission_handler.dart';
 
-/// Holds contacts loaded in two phases.
 class ContactsState {
-  /// Phase-1: display names only (fast). Empty until first load starts.
   final List<Contact> basic;
-
-  /// Phase-2: full contacts including phone numbers. Null = still loading.
   final List<Contact>? full;
-
-  /// True while either phase is in progress.
   final bool loading;
-
-  /// Non-null if permission was denied.
   final String? permissionError;
+  final String? phoneLoadError;
 
   const ContactsState({
     this.basic = const [],
     this.full,
     this.loading = false,
     this.permissionError,
+    this.phoneLoadError,
   });
 
-  /// The best list to display: full when available, basic otherwise.
   List<Contact> get contacts => full ?? basic;
-
-  /// True if phone numbers are not yet available.
-  bool get phonesLoading => full == null && loading;
+  bool get phonesReady => full != null;
+  bool get phonesLoading => full == null && loading && basic.isNotEmpty;
 }
 
 class ContactsNotifier extends AsyncNotifier<ContactsState> {
+  static const _basicLoadTimeout = Duration(seconds: 12);
+  static const _singleContactTimeout = Duration(seconds: 5);
+  final Map<String, Contact> _phoneCache = {};
+
   @override
   Future<ContactsState> build() async => const ContactsState();
 
-  /// Kick off the two-phase load. Safe to call multiple times
-  /// (skips if already loaded or loading).
   Future<void> load() async {
-    final cur = state.valueOrNull;
-    if (cur != null && (cur.loading || cur.full != null)) return;
+    final current = state.valueOrNull;
+    if (current != null &&
+        (current.loading ||
+            current.full != null ||
+            (current.basic.isNotEmpty && current.phoneLoadError != null))) {
+      return;
+    }
 
-    // Mark loading
-    state = AsyncData(const ContactsState(loading: true));
+    state = AsyncData(
+      ContactsState(
+        basic: current?.basic ?? const [],
+        full: current?.full,
+        loading: true,
+      ),
+    );
 
-    // Permission check
-    final status = await Permission.contacts.request();
-    if (!status.isGranted) {
+    final allowed = await _requestPermission();
+    if (!allowed) {
       state = const AsyncData(
         ContactsState(permissionError: 'Contacts permission denied'),
       );
       return;
     }
 
-    // ── Phase 1: names only (very fast) ──────────────────────────────────
-    final basic = await FlutterContacts.getContacts();
-    state = AsyncData(ContactsState(basic: basic, loading: true));
+    final basic = await _loadBasicContacts();
+    if (basic == null) {
+      state = const AsyncData(
+        ContactsState(
+          permissionError:
+              'Contacts did not respond. Retry, or use Paste to add numbers.',
+        ),
+      );
+      return;
+    }
 
-    // ── Phase 2: with phone numbers (slower) ─────────────────────────────
-    final full =
-        await FlutterContacts.getContacts(withProperties: true);
-    state = AsyncData(ContactsState(basic: basic, full: full, loading: false));
+    state = AsyncData(ContactsState(basic: basic, loading: false));
   }
 
-  /// Force a fresh reload (e.g., after the user grants permission later).
   Future<void> reload() async {
     state = const AsyncData(ContactsState());
     await load();
   }
+
+  Future<bool> _requestPermission() async {
+    try {
+      return await FlutterContacts.requestPermission(readonly: true)
+          .timeout(const Duration(seconds: 20));
+    } catch (_) {
+      return false;
+    }
+  }
+
+  Future<List<Contact>?> _loadBasicContacts() async {
+    try {
+      return await FlutterContacts.getContacts(
+        withProperties: false,
+        withThumbnail: false,
+        withPhoto: false,
+      ).timeout(_basicLoadTimeout);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<List<Contact>> getContactsWithPhones(Iterable<String> ids) async {
+    final uniqueIds = ids.toSet().toList(growable: false);
+    final resolved = <Contact>[];
+    final missing = <String>[];
+
+    for (final id in uniqueIds) {
+      final cached = _phoneCache[id];
+      if (cached != null) {
+        resolved.add(cached);
+      } else {
+        missing.add(id);
+      }
+    }
+
+    for (final id in missing) {
+      final contact = await _loadSingleContactWithPhones(id);
+      if (contact != null) {
+        _phoneCache[contact.id] = contact;
+        resolved.add(contact);
+      }
+    }
+
+    return resolved;
+  }
+
+  Future<Contact?> _loadSingleContactWithPhones(String id) async {
+    try {
+      return await FlutterContacts.getContact(
+        id,
+        withProperties: true,
+        withThumbnail: false,
+        withPhoto: false,
+        deduplicateProperties: true,
+      ).timeout(_singleContactTimeout);
+    } catch (_) {
+      return null;
+    }
+  }
+
 }
 
 final contactsProvider =

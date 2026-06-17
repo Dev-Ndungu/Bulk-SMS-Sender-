@@ -25,11 +25,14 @@ class SendNotifier extends Notifier<SendJob> {
   int _syncedRecordCount = 0;
 
   @override
-  SendJob build() => SendJob(
-        id: const Uuid().v4(),
-        recipients: const [],
-        message: '',
-      );
+  SendJob build() {
+    ref.onDispose(() => _pollTimer?.cancel());
+    return SendJob(
+      id: const Uuid().v4(),
+      recipients: const [],
+      message: '',
+    );
+  }
 
   /// Sends [message] to each recipient using a native background bulk job.
   /// Runs fully async – the user may navigate away; sending continues.
@@ -38,6 +41,17 @@ class SendNotifier extends Notifier<SendJob> {
     required String message,
     String? groupName,
   }) async {
+    final safeRecipients = _dedupeRecipients(recipients);
+    final cleanMessage = message.trim();
+    if (safeRecipients.isEmpty || cleanMessage.isEmpty) {
+      state = SendJob(
+        id: const Uuid().v4(),
+        recipients: safeRecipients,
+        message: cleanMessage,
+      );
+      return;
+    }
+
     _cancelled = false;
     _pollTimer?.cancel();
 
@@ -48,15 +62,15 @@ class SendNotifier extends Notifier<SendJob> {
 
     state = SendJob(
       id: jobId,
-      recipients: recipients,
-      message: message,
+      recipients: safeRecipients,
+      message: cleanMessage,
       status: JobStatus.running,
     );
 
     final campaign = CampaignSummary(
       id: jobId,
-      message: message,
-      numbers: recipients.map((r) => r.e164).toList(growable: false),
+      message: cleanMessage,
+      numbers: safeRecipients.map((r) => r.e164).toList(growable: false),
       sentAt: sentAt,
       groupName: groupName,
     );
@@ -67,12 +81,12 @@ class SendNotifier extends Notifier<SendJob> {
     try {
       final settingsRepo = ref.read(settingsRepositoryProvider);
       final subscriptionId = settingsRepo.selectedSimSubscriptionId;
-      final delayMs = settingsRepo.interSmsDelayMs;
-      final batchSize = settingsRepo.batchSize;
+      final delayMs = settingsRepo.interSmsDelayMs.clamp(0, 5000).toInt();
+      final batchSize = settingsRepo.batchSize.clamp(1, 500).toInt();
 
       final started = await SmsChannel.startBulkSend(
         jobId: jobId,
-        recipients: recipients
+        recipients: safeRecipients
             .map(
               (r) => {
                 'number': r.e164,
@@ -81,7 +95,7 @@ class SendNotifier extends Notifier<SendJob> {
               },
             )
             .toList(growable: false),
-        message: message,
+        message: cleanMessage,
         subscriptionId: subscriptionId >= 0 ? subscriptionId : null,
         groupName: groupName,
         delayMs: delayMs,
@@ -96,12 +110,53 @@ class SendNotifier extends Notifier<SendJob> {
       debugPrint('Native bulk send error: $e');
     }
 
+    if (defaultTargetPlatform == TargetPlatform.android) {
+      await _markNativeStartFailed(
+        jobId: jobId,
+        recipients: safeRecipients,
+        message: cleanMessage,
+        groupName: groupName,
+        sentAt: sentAt,
+      );
+      return;
+    }
+
     await _legacySendLoop(
       jobId: jobId,
-      recipients: recipients,
-      message: message,
+      recipients: safeRecipients,
+      message: cleanMessage,
       groupName: groupName,
     );
+  }
+
+  Future<void> _markNativeStartFailed({
+    required String jobId,
+    required List<Recipient> recipients,
+    required String message,
+    required String? groupName,
+    required DateTime sentAt,
+  }) async {
+    try {
+      await ref.read(campaignsRepositoryProvider).update(
+            CampaignSummary(
+              id: jobId,
+              message: message,
+              numbers: recipients.map((r) => r.e164).toList(growable: false),
+              sentAt: sentAt,
+              sent: 0,
+              failed: recipients.length,
+              groupName: groupName,
+            ),
+          );
+      ref.read(campaignsProvider.notifier).refresh();
+    } catch (_) {}
+
+    try {
+      state = state.copyWith(
+        failed: recipients.length,
+        status: JobStatus.done,
+      );
+    } catch (_) {}
   }
 
   void _startPolling(String jobId) {
@@ -112,15 +167,21 @@ class SendNotifier extends Notifier<SendJob> {
         return;
       }
 
-      final snapshot = await BulkSendSyncService.fetchJob(jobId);
+      final BulkSendJobSnapshot? snapshot;
+      try {
+        snapshot = await BulkSendSyncService.fetchJob(
+          jobId,
+          recordsFrom: _syncedRecordCount,
+        );
+      } catch (e) {
+        debugPrint('Bulk send polling error: $e');
+        return;
+      }
       if (snapshot == null) return;
 
-      if (snapshot.records.length > _syncedRecordCount) {
-        await BulkSendSyncService.persistSnapshot(
-          snapshot,
-          alreadyPersistedCount: _syncedRecordCount,
-        );
-        _syncedRecordCount = snapshot.records.length;
+      if (snapshot.records.isNotEmpty) {
+        await BulkSendSyncService.persistSnapshot(snapshot);
+        _syncedRecordCount += snapshot.records.length;
         ref.read(campaignsProvider.notifier).refresh();
         ref.read(reports.reportsProvider.notifier).refresh();
       }
@@ -139,11 +200,12 @@ class SendNotifier extends Notifier<SendJob> {
   Future<void> _finalizeFromSnapshot(BulkSendJobSnapshot snapshot) async {
     if (_activeJobId != snapshot.jobId) return;
 
-    await BulkSendSyncService.persistSnapshot(
-      snapshot,
-      alreadyPersistedCount: _syncedRecordCount,
-    );
-    _syncedRecordCount = snapshot.records.length;
+    if (snapshot.records.isNotEmpty) {
+      await BulkSendSyncService.persistSnapshot(snapshot);
+      _syncedRecordCount += snapshot.records.length;
+    } else {
+      await ref.read(campaignsRepositoryProvider).save(snapshot.toCampaignSummary());
+    }
 
     ref.read(campaignsProvider.notifier).refresh();
     ref.read(reports.reportsProvider.notifier).refresh();
@@ -158,6 +220,10 @@ class SendNotifier extends Notifier<SendJob> {
         status: _cancelled ? JobStatus.cancelled : JobStatus.done,
       );
     } catch (_) {}
+
+    if (snapshot.isComplete) {
+      unawaited(SmsChannel.clearBulkSendJob(snapshot.jobId));
+    }
   }
 
   Future<void> _legacySendLoop({
@@ -171,8 +237,8 @@ class SendNotifier extends Notifier<SendJob> {
     var failed = 0;
     final settingsRepo = ref.read(settingsRepositoryProvider);
     final subscriptionId = settingsRepo.selectedSimSubscriptionId;
-    final delayMs = settingsRepo.interSmsDelayMs;
-    final batchSize = settingsRepo.batchSize;
+    final delayMs = settingsRepo.interSmsDelayMs.clamp(0, 5000).toInt();
+    final batchSize = settingsRepo.batchSize.clamp(1, 500).toInt();
 
     for (int i = 0; i < recipients.length; i++) {
       if (_cancelled) break;
@@ -253,6 +319,9 @@ class SendNotifier extends Notifier<SendJob> {
       unawaited(SmsChannel.cancelBulkSend(jobId));
     }
     _pollTimer?.cancel();
+    if (state.status == JobStatus.running) {
+      state = state.copyWith(status: JobStatus.cancelled);
+    }
   }
 
   void reset() {
@@ -270,11 +339,20 @@ class SendNotifier extends Notifier<SendJob> {
   String _applyMergeTags(String msg, Recipient r) {
     var body = msg;
     r.mergeTags.forEach((k, v) => body = body.replaceAll('{{$k}}', v));
-    if (r.displayName != null) {
-      body = body.replaceAll('{{name}}', r.displayName!);
-    }
+    body = body.replaceAll('{{name}}', r.displayName ?? '');
     body = body.replaceAll('{{phone}}', r.e164);
     return body;
+  }
+
+  List<Recipient> _dedupeRecipients(List<Recipient> recipients) {
+    final seen = <String>{};
+    final cleaned = <Recipient>[];
+    for (final recipient in recipients) {
+      if (seen.add(recipient.e164)) {
+        cleaned.add(recipient);
+      }
+    }
+    return cleaned;
   }
 }
 

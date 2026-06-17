@@ -75,7 +75,7 @@ data class BulkSmsJob(
 ) {
     val total: Int get() = recipients.size
 
-    fun toJson(): JSONObject = JSONObject().apply {
+    fun toJson(includeRecords: Boolean = true): JSONObject = JSONObject().apply {
         put("jobId", jobId)
         put("message", message)
         put("recipients", JSONArray(recipients.map { it.toJson() }))
@@ -88,11 +88,13 @@ data class BulkSmsJob(
         put("failed", failed)
         put("nextIndex", nextIndex)
         put("createdAt", createdAt)
-        put("records", JSONArray(records.map { it.toJson() }))
+        if (includeRecords) {
+            put("records", JSONArray(records.map { it.toJson() }))
+        }
     }
 
     companion object {
-        fun fromJson(obj: JSONObject): BulkSmsJob {
+        fun fromJson(obj: JSONObject, includeRecords: Boolean = true): BulkSmsJob {
             val recipients = mutableListOf<BulkSmsRecipient>()
             val rawRecipients = obj.optJSONArray("recipients") ?: JSONArray()
             for (i in 0 until rawRecipients.length()) {
@@ -100,9 +102,11 @@ data class BulkSmsJob(
             }
 
             val records = mutableListOf<BulkSmsRecord>()
-            val rawRecords = obj.optJSONArray("records") ?: JSONArray()
-            for (i in 0 until rawRecords.length()) {
-                records += BulkSmsRecord.fromJson(rawRecords.getJSONObject(i))
+            if (includeRecords) {
+                val rawRecords = obj.optJSONArray("records") ?: JSONArray()
+                for (i in 0 until rawRecords.length()) {
+                    records += BulkSmsRecord.fromJson(rawRecords.getJSONObject(i))
+                }
             }
 
             return BulkSmsJob(
@@ -124,7 +128,7 @@ data class BulkSmsJob(
     }
 }
 
-fun bulkSmsJobToMap(job: BulkSmsJob): Map<String, Any?> = mapOf(
+fun bulkSmsJobToMap(job: BulkSmsJob, recordsFrom: Int = 0): Map<String, Any?> = mapOf(
     "jobId" to job.jobId,
     "message" to job.message,
     "numbers" to job.recipients.map { it.number },
@@ -137,7 +141,7 @@ fun bulkSmsJobToMap(job: BulkSmsJob): Map<String, Any?> = mapOf(
     "nextIndex" to job.nextIndex,
     "total" to job.total,
     "createdAt" to job.createdAt,
-    "records" to job.records.map { record ->
+    "records" to job.records.drop(recordsFrom.coerceAtLeast(0)).map { record ->
         mapOf(
             "number" to record.number,
             "messageBody" to record.messageBody,

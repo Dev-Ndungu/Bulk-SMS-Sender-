@@ -4,12 +4,14 @@ library;
 enum SmsDirection { sent, received }
 
 class SmsMessage {
+  final int? id;
   final String number; // E.164 or raw sender
   final String body;
   final DateTime timestamp;
   final SmsDirection direction;
 
   const SmsMessage({
+    this.id,
     required this.number,
     required this.body,
     required this.timestamp,
@@ -17,6 +19,7 @@ class SmsMessage {
   });
 
   Map<String, dynamic> toMap() => {
+        'id': id,
         'number': number,
         'body': body,
         'timestamp': timestamp.toIso8601String(),
@@ -24,6 +27,7 @@ class SmsMessage {
       };
 
   factory SmsMessage.fromMap(Map map) => SmsMessage(
+        id: (map['id'] as num?)?.toInt(),
         number: map['number'] as String,
         body: map['body'] as String,
         timestamp: DateTime.parse(map['timestamp'] as String),
